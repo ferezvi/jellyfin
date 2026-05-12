@@ -30,7 +30,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             foreach (var paragraph in subtitle.Paragraphs)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var (line, position) = ExtractPosition(paragraph);
+                var (line, position) = ExtractPosition(paragraph, subtitle);
                 var text = CleanText(paragraph.Text);
                 jsonWriter.WriteStartObject();
                 jsonWriter.WriteString("Id", paragraph.Number.ToString(CultureInfo.InvariantCulture));
@@ -81,14 +81,16 @@ namespace MediaBrowser.MediaEncoding.Subtitles
 
         /// <summary>
         /// Extracts line and position from a subtitle paragraph.
-        /// For WebVTT subtitles, reads the exact percentage values from the Style property (requires libse 4.1.0+).
+        /// For WebVTT subtitles, reads the exact percentage values from the Style property,
+        /// which libse populates when loading VTT files.
+        /// For ASS subtitles, extracts \pos(x,y) from the text and converts to percentages
+        /// using the subtitle resolution from the header.
         /// Falls back to parsing an {\anN} ASS alignment tag from the text for SRT and other formats.
         /// Returns (90, 50) — bottom center — when no position information is found.
         /// </summary>
-        private static (int Line, int Position) ExtractPosition(Paragraph paragraph)
+        private static (int Line, int Position) ExtractPosition(Paragraph paragraph, Subtitle subtitle)
         {
             // WebVTT: extract positioning from the Style property (format: "position:50% line:90%")
-            // Uses named groups so the regex order doesn't matter.
             if (!string.IsNullOrEmpty(paragraph.Style))
             {
                 var posMatch = Regex.Match(paragraph.Style, @"position:(?<position>\d+)%");
@@ -99,6 +101,17 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                     int line = int.Parse(lineMatch.Groups["line"].Value, CultureInfo.InvariantCulture);
                     int position = int.Parse(posMatch.Groups["position"].Value, CultureInfo.InvariantCulture);
                     return (line, position);
+                }
+            }
+
+            // ASS: extract \pos(x,y) from text
+            if (paragraph.Text.Contains(@"{\pos", StringComparison.Ordinal))
+            {
+                var (resX, resY) = GetPlayRes(subtitle);
+                var assPos = GetAssPosition(paragraph, resX, resY);
+                if (assPos.HasValue)
+                {
+                    return assPos.Value;
                 }
             }
 
@@ -142,6 +155,39 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             }
 
             return Regex.Replace(text, @"^\{\\an[1-9]\}", string.Empty);
+        }
+
+        /// <summary>
+        /// Reads PlayResX and PlayResY from the subtitle header.
+        /// Falls back to 1920x1080 when the header is absent or unparseable.
+        /// </summary>
+        private static (int Width, int Height) GetPlayRes(Subtitle subtitle)
+        {
+            var widthMatch = Regex.Match(subtitle.Header ?? string.Empty, @"PlayResX:\s*(\d+)");
+            var heightMatch = Regex.Match(subtitle.Header ?? string.Empty, @"PlayResY:\s*(\d+)");
+            int width = widthMatch.Success ? int.Parse(widthMatch.Groups[1].Value, CultureInfo.InvariantCulture) : 1920;
+            int height = heightMatch.Success ? int.Parse(heightMatch.Groups[1].Value, CultureInfo.InvariantCulture) : 1080;
+            return (width, height);
+        }
+
+        /// <summary>
+        /// Extracts \pos(x,y) from an ASS paragraph's Text and converts it to
+        /// percentage-based line and position values using the subtitle resolution.
+        /// Returns null when no \pos tag is found.
+        /// </summary>
+        private static (int Line, int Position)? GetAssPosition(Paragraph paragraph, int resX, int resY)
+        {
+            var match = Regex.Match(paragraph.Text, @"\{\\pos\((?<x>\d+(?:\.\d+)?),(?<y>\d+(?:\.\d+)?)\)");
+            if (!match.Success)
+            {
+                return null;
+            }
+
+            double x = double.Parse(match.Groups["x"].Value, CultureInfo.InvariantCulture);
+            double y = double.Parse(match.Groups["y"].Value, CultureInfo.InvariantCulture);
+            int position = (int)Math.Round(x / resX * 100);
+            int line = (int)Math.Round(y / resY * 100);
+            return (line, position);
         }
     }
 }

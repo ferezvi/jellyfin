@@ -89,13 +89,14 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                 var subtitle = Subtitle.Parse(stream, Path.GetExtension(inputInfo.Path));
 
                 FilterEvents(subtitle, startTimeTicks, endTimeTicks, preserveOriginalTimestamps);
-
-                var formatter = GetWriter(outputFormat);
-
-                var text = formatter.ToText(subtitle, "untitled");
-                using (var writer = new StreamWriter(stream, Encoding.UTF8, 1024, true))
+                // Convert the subtitle to the requested output format.
+                // JSON is handled separately in LibseExtensions.ToText() to preserve
+                // position and line metadata that would be lost in a standard format conversion.
+                var text = subtitle.ToText(outputFormat, cancellationToken);
+                using (var writer = new StreamWriter(ms, Encoding.UTF8, 1024, leaveOpen: true))
                 {
                     writer.Write(text);
+                    writer.Flush();
                 }
 
                 ms.Position = 0;
@@ -133,6 +134,13 @@ namespace MediaBrowser.MediaEncoding.Subtitles
 
         async Task<Stream> ISubtitleEncoder.GetSubtitles(BaseItem item, string mediaSourceId, int subtitleStreamIndex, string outputFormat, long startTimeTicks, long endTimeTicks, bool preserveOriginalTimestamps, CancellationToken cancellationToken)
         {
+            // Normalize client-requested format names to file extensions
+            outputFormat = outputFormat.ToLowerInvariant() switch
+            {
+                "webvtt" => "vtt",
+                "subrip" => "srt",
+                _ => outputFormat
+            };
             ArgumentNullException.ThrowIfNull(item);
 
             if (string.IsNullOrWhiteSpace(mediaSourceId))
@@ -154,6 +162,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             // Return the original if the same format is being requested
             // Character encoding was already handled in GetSubtitleStream
             // ASS is a superset of SSA, skipping the conversion and preserving the styles
+            _logger.LogInformation("DEBUG GetSubtitles - info.Format: {InfoFormat}, outputFormat: {OutputFormat}", info.Format, outputFormat);
             if (string.Equals(info.Format, outputFormat, StringComparison.OrdinalIgnoreCase)
                 || (string.Equals(info.Format, SubtitleFormat.SSA, StringComparison.OrdinalIgnoreCase)
                     && string.Equals(outputFormat, SubtitleFormat.ASS, StringComparison.OrdinalIgnoreCase)))
@@ -232,6 +241,16 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             var currentFormat = subtitleStream.Codec ?? Path.GetExtension(subtitleStream.Path)
                 .TrimStart('.');
 
+            // Map ffprobe codec names to file extensions that the subtitle parser recognizes.
+            // Without this, codecs like "webvtt" would not be recognized and fall back to ffmpeg,
+            // which strips metadata like position and line.
+            currentFormat = currentFormat.ToLowerInvariant() switch
+            {
+                "webvtt" => "vtt",
+                "subrip" => "srt",
+                _ => currentFormat
+            };
+
             // Handle PGS subtitles as raw streams for the client to render
             if (MediaStream.IsPgsFormat(currentFormat))
             {
@@ -269,59 +288,6 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                 Format = currentFormat,
                 IsExternal = true
             };
-        }
-
-        private bool TryGetWriter(string format, [NotNullWhen(true)] out Nikse.SubtitleEdit.Core.SubtitleFormats.SubtitleFormat? value)
-        {
-            ArgumentException.ThrowIfNullOrEmpty(format);
-
-            if (string.Equals(format, SubtitleFormat.ASS, StringComparison.OrdinalIgnoreCase))
-            {
-                value = new AdvancedSubStationAlpha();
-                return true;
-            }
-
-            if (string.Equals(format, "json", StringComparison.OrdinalIgnoreCase))
-            {
-                throw new NotImplementedException();
-            }
-
-            if (string.Equals(format, SubtitleFormat.SRT, StringComparison.OrdinalIgnoreCase) || string.Equals(format, SubtitleFormat.SUBRIP, StringComparison.OrdinalIgnoreCase))
-            {
-                value = new SubRip();
-                return true;
-            }
-
-            if (string.Equals(format, SubtitleFormat.SSA, StringComparison.OrdinalIgnoreCase))
-            {
-                value = new SubStationAlpha();
-                return true;
-            }
-
-            if (string.Equals(format, SubtitleFormat.VTT, StringComparison.OrdinalIgnoreCase) || string.Equals(format, SubtitleFormat.WEBVTT, StringComparison.OrdinalIgnoreCase))
-            {
-                value = new WebVTT();
-                return true;
-            }
-
-            if (string.Equals(format, SubtitleFormat.TTML, StringComparison.OrdinalIgnoreCase))
-            {
-                value = new TimedText10();
-                return true;
-            }
-
-            value = null;
-            return false;
-        }
-
-        private Nikse.SubtitleEdit.Core.SubtitleFormats.SubtitleFormat GetWriter(string format)
-        {
-            if (TryGetWriter(format, out var writer))
-            {
-                return writer;
-            }
-
-            throw new ArgumentException("Unsupported format: " + format);
         }
 
         /// <summary>
